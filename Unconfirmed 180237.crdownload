@@ -1,0 +1,150 @@
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import db, sync
+
+st.set_page_config(page_title="Student Academic & Activity Ledger", layout="wide")
+db.init_db()
+st.title("🎓 Student Academic & Activity Ledger")
+
+
+@st.cache_resource
+def _start_background_sync():
+    sync.start_watcher()      # pushes every database change to the sheet automatically
+    return True
+
+
+_start_background_sync()
+
+
+def after_change():
+    st.toast("Saved. The spreadsheet updates automatically in a few seconds.")
+
+
+# Input validation in the grid: dropdowns for fixed choices and number limits, so typing mistakes are
+# blocked before they reach the database (the database constraints still protect against everything else).
+SEL, NUM = st.column_config.SelectboxColumn, st.column_config.NumberColumn
+COLCFG = {
+    "student": {"status": SEL(options=["ACTIVE", "DROPPED", "PASSED_OUT"], required=True)},
+    "board_result": {"level": SEL(options=["SECONDARY", "HIGHER_SECONDARY"], required=True),
+                     "percentage": NUM(min_value=0, max_value=100)},
+    "semester": {"sem_no": NUM(min_value=1, max_value=8, step=1), "sgpa": NUM(min_value=0, max_value=10),
+                 "result_status": SEL(options=["PASS", "ATKT", "FAIL", "ONGOING"], required=True)},
+    "gap_year": {"kind": SEL(options=["DROP", "GAP"], required=True)},
+    "subject": {"kind": SEL(options=["THEORY", "LAB"], required=True), "sem_no": NUM(min_value=1, max_value=8, step=1),
+                "credits": NUM(min_value=1, step=1), "max_marks": NUM(min_value=1, step=1)},
+    "mark": {"marks": NUM(min_value=0)},
+    "activity": {"category": SEL(options=["SEMINAR", "CO_CURRICULAR", "EXTRA_CURRICULAR"], required=True),
+                 "scope": SEL(options=["INTERNAL", "EXTERNAL"])},
+}
+
+
+def progression_fig(sem, gaps):
+    sem = sem.sort_values("sem_no").copy()
+    sem["t"] = sem.academic_year + (sem.sem_no % 2 == 0) * 0.5
+    sem["cgpa"] = sem.sgpa.expanding().mean().round(2)
+    fig = go.Figure()
+    fig.add_scatter(x=sem.t, y=sem.sgpa, mode="lines+markers", name="SGPA", text="Sem " + sem.sem_no.astype(str),
+                    hovertemplate="%{text}<br>SGPA %{y}<extra></extra>")
+    fig.add_scatter(x=sem.t, y=sem.cgpa, mode="lines+markers", name="CGPA", line=dict(dash="dot"),
+                    hovertemplate="CGPA %{y}<extra></extra>")
+    for i, g in enumerate(gaps.itertuples()):
+        fig.add_vrect(x0=g.start_year, x1=g.start_year + 1, fillcolor="red", opacity=0.15, line_width=0)
+        fig.add_scatter(x=[g.start_year + 0.5], y=[5], mode="markers+text", text=[g.kind.title() + " year"],
+                        textposition="top center", marker=dict(color="red", symbol="x", size=14),
+                        name="Drop/gap year", showlegend=(i == 0),
+                        hovertemplate=f"{g.kind} {g.start_year}-{str(g.start_year + 1)[2:]}<br>{g.reason or ''}<extra></extra>")
+    lo = int(min(sem.academic_year.min(), *(gaps.start_year if len(gaps) else [9999])))
+    hi = int(max(sem.academic_year.max(), *(gaps.start_year if len(gaps) else [0])))
+    yrs = list(range(lo, hi + 2))
+    fig.update_layout(xaxis=dict(tickvals=yrs, ticktext=[f"{y}-{str(y + 1)[2:]}" for y in yrs], title="Academic year"),
+                      yaxis=dict(range=[0, 10.5], title="Grade point"), height=420, margin=dict(t=30))
+    return fig
+
+
+tab_dash, tab_edit, tab_seg, tab_sync = st.tabs(["📈 Dashboard", "✍️ Edit data", "🗂️ Activities", "🔄 Sync"])
+
+# ---------------- Dashboard ----------------
+with tab_dash:
+    q = st.text_input("🔍 Search student by name", placeholder="e.g. Aarav")
+    hits = db.search_students(q) if q else db.search_students("")
+    if not hits:
+        st.info("No student found.")
+    else:
+        pick = st.selectbox("Student", hits, format_func=lambda s: f"{s['name']} (ID {s['student_id']})")
+        sid = pick["student_id"]
+        badge = {"ACTIVE": "🟢", "DROPPED": "🔴", "PASSED_OUT": "🎓"}[pick["status"]]
+        st.markdown(f"### {pick['name']}  {badge} Current status: **{pick['status'].replace('_', ' ').title()}**")
+        c1, c2 = st.columns(2)
+        c1.subheader("Board results")
+        c1.dataframe(db.df_for_student("board_result", sid).drop(columns=["result_id", "student_id"]), hide_index=True)
+        gaps = db.df_for_student("gap_year", sid)
+        c2.subheader("Drop / gap years")
+        c2.dataframe(gaps.drop(columns=["gap_id", "student_id"]) if len(gaps) else gaps, hide_index=True)
+        sem = db.df_for_student("semester", sid)
+        st.subheader("Semester Progression Curve")
+        if sem.empty: st.info("No semester grades yet.")
+        else:
+            st.plotly_chart(progression_fig(sem, gaps), width="stretch")
+            st.caption("Semester-wise status")
+            st.dataframe(sem.sort_values("sem_no")[["sem_no", "academic_year", "sgpa", "result_status"]], hide_index=True)
+        st.subheader("Subject & lab marks")
+        m = db.marks_for_student(sid)
+        for s_no, g in m.groupby("sem_no"):
+            with st.expander(f"Semester {s_no}"):
+                st.dataframe(g.drop(columns="sem_no"), hide_index=True)
+
+# ---------------- Edit ----------------
+with tab_edit:
+    st.caption("Edit cells, add rows at the bottom, or select a row and press Delete. Every save is checked against the database constraints.")
+    name = st.selectbox("Table", db.ORDER)
+    t = db.TABLES[name]; pk = list(t.primary_key.columns)[0].name
+    orig = db.table_df(name)
+    cfg = {c.name: st.column_config.DateColumn(format="YYYY-MM-DD") for c in t.columns if c.type.python_type.__name__ == "date"}
+    for c in cfg: orig[c] = pd.to_datetime(orig[c])
+    cfg.update(COLCFG.get(name, {}))
+    edited = st.data_editor(orig, num_rows="dynamic", disabled=[pk], column_config=cfg, width="stretch", key=f"ed_{name}")
+    if st.button("💾 Save changes", type="primary"):
+        errs = []
+        gone = set(orig[pk]) - set(edited[pk].dropna().astype(int))
+        for i in gone:
+            e = db.delete_row(name, i); errs += [f"Row {i}: {e}"] if e else []
+        for _, r in edited.iterrows():
+            e = db.save_row(name, r.to_dict())
+            if e: errs.append(f"Row {r[pk] if pd.notna(r[pk]) else '(new)'}: {e}")
+        if errs:
+            st.error("Some changes were rejected:"); [st.write("• " + e) for e in errs]
+        else:
+            st.success("Saved.")
+        after_change()
+        if not errs: st.rerun()
+
+# ---------------- Segregation ----------------
+with tab_seg:
+    act = db.activity_df()
+    who = st.selectbox("Filter by student", ["All"] + sorted(act.student.unique().tolist()))
+    if who != "All": act = act[act.student == who]
+    a, b, c, d = st.tabs(["Internal seminars", "External seminars", "Technical / Co-curricular", "Extra-curricular"])
+    cols = ["student", "title", "organizer", "activity_date", "details"]
+    a.dataframe(act[(act.category == "SEMINAR") & (act.scope == "INTERNAL")][cols], hide_index=True)
+    b.dataframe(act[(act.category == "SEMINAR") & (act.scope == "EXTERNAL")][cols], hide_index=True)
+    c.dataframe(act[act.category == "CO_CURRICULAR"][cols], hide_index=True)
+    d.dataframe(act[act.category == "EXTRA_CURRICULAR"][cols], hide_index=True)
+
+# ---------------- Sync ----------------
+with tab_sync:
+    st.write(f"Active sheet backend: **{sync.backend().name}**")
+    st.write(f"Automatic sync: **{sync.STATE['watcher']}**, last push: **{sync.STATE['last_push'] or 'not yet'}**, "
+             f"pushes this session: **{sync.STATE['pushes']}**")
+    st.caption("Every change (GUI, spreadsheet pull or direct SQL) is pushed to the sheet automatically. "
+               "The buttons below are for forcing a refresh.")
+    if sync.STATE["last_error"]:
+        st.warning(f"Last sync problem (it retries automatically): {sync.STATE['last_error']}")
+    c1, c2 = st.columns(2)
+    if c1.button("⬆️ Push DB → sheet"):
+        st.success(f"Pushed to {sync.push()}")
+    if c2.button("⬇️ Pull sheet → DB (validated)"):
+        n, errs = sync.pull()
+        st.success(f"{n} rows accepted.")
+        if errs:
+            st.error(f"{len(errs)} rows rejected and reverted in the sheet:"); [st.write("• " + e) for e in errs]

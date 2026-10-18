@@ -1,0 +1,14 @@
+"""Read a setting from an environment variable first, then from Streamlit secrets (used when hosted)."""
+import os
+
+def get(name, default=None):
+    v = os.getenv(name)
+    if v:
+        return v
+    try:
+        import streamlit as st
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return default
